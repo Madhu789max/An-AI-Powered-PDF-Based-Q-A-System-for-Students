@@ -1,0 +1,241 @@
+{\rtf1\ansi\ansicpg1252\deff0\nouicompat\deflang1033{\fonttbl{\f0\fnil\fcharset0 Calibri;}{\f1\fnil Calibri;}}
+{\*\generator Riched20 10.0.22621}\viewkind4\uc1 
+\pard\sa200\sl276\slmult1\f0\fs22\lang9 StudyMate - AI-powered PDF Q&A System (single-file prototype)\par
+\par
+File: studymate_pdf_qa_app.py\par
+\par
+What this file contains:\par
+- A minimal FastAPI app that accepts PDF uploads, extracts text, chunks it,\par
+  builds embeddings using sentence-transformers, stores vectors in FAISS (in-memory),\par
+  and answers user queries by retrieving relevant chunks and calling OpenAI's ChatCompletion\par
+  to produce a concise, student-friendly answer.\par
+\par
+Notes / Requirements:\par
+- This is a prototype to run locally for development and learning.\par
+- Install the required packages (example):\par
+\par
+    pip install fastapi uvicorn python-multipart PyMuPDF sentence-transformers faiss-cpu openai pydantic\par
+\par
+- You must set environment variable OPENAI_API_KEY to use the OpenAI ChatCompletion API.\par
+\par
+How to run:\par
+- Start the server:\par
+    uvicorn studymate_pdf_qa_app:app --reload --port 8000\par
+- Endpoints (JSON / form-data):\par
+    POST /upload  -> form field: file (PDF). Returns a document_id\par
+    POST /query   -> JSON: \{"document_id": "...", "question": "...", "top_k": 4\}\par
+\par
+Limitations & TODOs:\par
+- This prototype stores vectors in-memory; restart will lose all uploaded docs.\par
+- For production, add persistent vector DB, authentication, rate limiting, and frontend.\par
+\par
+"""\par
+\par
+from fastapi import FastAPI, UploadFile, File, HTTPException\par
+from pydantic import BaseModel\par
+import fitz  # PyMuPDF\par
+from sentence_transformers import SentenceTransformer\par
+import numpy as np\par
+import faiss\par
+import uuid\par
+import os\par
+import openai\par
+import textwrap\par
+from typing import List\par
+\par
+# --------- Configuration ---------\par
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")\par
+if not OPENAI_API_KEY:\par
+    print("WARNING: OPENAI_API_KEY not set. Set it to enable answer generation.")\par
+else:\par
+    openai.api_key = OPENAI_API_KEY\par
+\par
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"  # sentence-transformers model\par
+CHUNK_SIZE = 800  # approx chars per chunk\par
+CHUNK_OVERLAP = 100\par
+EMBEDDING_DIM = 384  # for all-MiniLM-L6-v2\par
+\par
+# --------- In-memory stores (prototype) ---------\par
+# docs: document_id -> \{"text_chunks": [...], "metadatas": [...], "faiss_index": index\}\par
+DOC_STORE = \{\}\par
+\par
+# Load embedding model once\par
+embedder = SentenceTransformer(EMBED_MODEL_NAME)\par
+\par
+app = FastAPI(title="StudyMate - PDF Q&A Prototype")\par
+\par
+\par
+# --------- Utility functions ---------\par
+\par
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:\par
+    """Extracts full text from PDF bytes using PyMuPDF (fitz)."""\par
+    # read into a fitz Document\par
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")\par
+    parts = []\par
+    for page in doc:\par
+        parts.append(page.get_text("text"))\par
+    return "\\n\\n".join(parts)\par
+\par
+\par
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:\par
+    """Simple character-based chunker with overlap."""\par
+    text = text.replace("\\r\\n", "\\n")\par
+    chunks = []\par
+    start = 0\par
+    L = len(text)\par
+    while start < L:\par
+        end = min(start + chunk_size, L)\par
+        chunk = text[start:end].strip()\par
+        if chunk:\par
+            chunks.append(chunk)\par
+        start = end - overlap\par
+        if start < 0:\par
+            start = 0\par
+    return chunks\par
+\par
+\par
+def build_faiss_index(embeddings: np.ndarray):\par
+    """Creates a simple flat FAISS index for the given embeddings."""\par
+    index = faiss.IndexFlatIP(EMBEDDING_DIM)  # inner product (use cosine after normalization)\par
+    # normalize embeddings to unit length for cosine similarity using IP\par
+    faiss.normalize_L2(embeddings)\par
+    index.add(embeddings)\par
+    return index\par
+\par
+\par
+def embed_texts(texts: List[str]) -> np.ndarray:\par
+    """Return numpy array of embeddings for a list of texts."""\par
+    embs = embedder.encode(texts, convert_to_numpy=True, show_progress_bar=False)\par
+    # ensure shape (n, dim)\par
+    return embs\par
+\par
+\par
+def retrieve_top_k(index, query_embedding: np.ndarray, k: int = 4):\par
+    """Return top-k indices and scores from FAISS index for a single query embedding."""\par
+    q = query_embedding.astype('float32')\par
+    faiss.normalize_L2(q)\par
+    D, I = index.search(q, k)\par
+    # D: similarity scores, I: indices\par
+    return I[0].tolist(), D[0].tolist()\par
+\par
+\par
+def generate_answer(question: str, context_chunks: List[str]) -> str:\par
+    """Calls OpenAI ChatCompletion with the retrieved context and question to produce an answer.\par
+    If OPENAI_API_KEY is not set, returns a fallback message.\par
+    """\par
+    if not OPENAI_API_KEY:\par
+        # Fallback \f1\emdash  return combined context and a hint to run with OpenAI key\par
+        ctx_preview = textwrap.shorten("\\n\\n".join(context_chunks), width=1000)\par
+        return f"(OpenAI API key not configured) Retrieved context:\\n\{ctx_preview\}\\n\\nQuestion: \{question\}"\par
+\par
+    system_prompt = (\par
+        "You are a helpful tutor assistant for students. Use the provided context (excerpts from a PDF) to answer the question concisely. "\par
+        "If the answer isn't contained in the context, say you don't know and provide guidance on how to find it. Keep explanations simple and include examples when helpful."\par
+    )\par
+\par
+    # Build the user prompt combining question + retrieved context\par
+    context_text = "\\n\\n---\\n\\n".join(context_chunks)\par
+    user_prompt = (\par
+        f"Context excerpts:\\n\{context_text\}\\n\\nQuestion: \{question\}\\n\\nAnswer in a few clear sentences, cite which excerpt (by number) you used if helpful."\par
+    )\par
+\par
+    resp = openai.ChatCompletion.create(\par
+        model="gpt-4o-mini",  # adjust to available model; user can change\par
+        messages=[\par
+            \{"role": "system", "content": system_prompt\},\par
+            \{"role": "user", "content": user_prompt\},\par
+        ],\par
+        max_tokens=500,\par
+        temperature=0.2,\par
+    )\par
+    return resp.choices[0].message.content.strip()\par
+\par
+\par
+# --------- API models ---------\par
+class UploadResponse(BaseModel):\par
+    document_id: str\par
+    num_chunks: int\par
+\par
+\par
+class QueryRequest(BaseModel):\par
+    document_id: str\par
+    question: str\par
+    top_k: int = 4\par
+\par
+\par
+class QueryResponse(BaseModel):\par
+    answer: str\par
+    used_chunk_indices: List[int]\par
+    scores: List[float]\par
+\par
+\par
+# --------- API endpoints ---------\par
+@app.post("/upload", response_model=UploadResponse)\par
+async def upload_pdf(file: UploadFile = File(...)):\par
+    if file.content_type != "application/pdf":\par
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")\par
+\par
+    pdf_bytes = await file.read()\par
+    text = extract_text_from_pdf_bytes(pdf_bytes)\par
+    if not text.strip():\par
+        raise HTTPException(status_code=400, detail="No text found in PDF.")\par
+\par
+    chunks = chunk_text(text)\par
+    if not chunks:\par
+        raise HTTPException(status_code=400, detail="Failed to chunk document text.")\par
+\par
+    embeddings = embed_texts(chunks).astype('float32')\par
+    index = build_faiss_index(embeddings)\par
+\par
+    doc_id = str(uuid.uuid4())\par
+    DOC_STORE[doc_id] = \{\par
+        "text_chunks": chunks,\par
+        "faiss_index": index,\par
+        "embeddings": embeddings,  # we store embeddings in case we need them\par
+    \}\par
+\par
+    return UploadResponse(document_id=doc_id, num_chunks=len(chunks))\par
+\par
+\par
+@app.post("/query", response_model=QueryResponse)\par
+async def query_document(q: QueryRequest):\par
+    if q.document_id not in DOC_STORE:\par
+        raise HTTPException(status_code=404, detail="Document not found. Upload first.")\par
+\par
+    store = DOC_STORE[q.document_id]\par
+    index = store["faiss_index"]\par
+    chunks = store["text_chunks"]\par
+\par
+    # embed the question\par
+    q_emb = embed_texts([q.question]).astype('float32')\par
+\par
+    # retrieve\par
+    top_k = max(1, min(10, q.top_k))\par
+    ids, scores = retrieve_top_k(index, q_emb, k=top_k)\par
+\par
+    # prepare context chunks to send to generation model\par
+    retrieved_chunks = []\par
+    used_indices = []\par
+    used_scores = []\par
+    for idx, sc in zip(ids, scores):\par
+        if idx < 0 or idx >= len(chunks):\par
+            continue\par
+        retrieved_chunks.append(chunks[idx])\par
+        used_indices.append(int(idx))\par
+        used_scores.append(float(sc))\par
+\par
+    # generate an answer\par
+    answer = generate_answer(q.question, retrieved_chunks)\par
+\par
+    return QueryResponse(answer=answer, used_chunk_indices=used_indices, scores=used_scores)\par
+\par
+\par
+# --------- Simple health endpoint ---------\par
+@app.get("/health")\par
+def health_check():\par
+    return \{"status": "ok", "documents": len(DOC_STORE)\}\par
+\par
+\par
+\f0\par
+}
+ 
